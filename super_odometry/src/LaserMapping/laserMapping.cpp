@@ -18,110 +18,167 @@ namespace super_odometry {
     this->get_logger().set_level(rclcpp::Logger::Level::Debug);
     }
 
+    /**
+     * [功能描述]：初始化激光建图模块的ROS2接口
+     * 该函数负责：
+     * 1. 配置ROS2回调组和订阅选项
+     * 2. 读取全局参数、系统参数和标定参数
+     * 3. 初始化点云降采样滤波器
+     * 4. 创建话题订阅者和发布者
+     * 5. 配置SLAM系统参数
+     * 6. 启动定时处理任务
+     * @return 无返回值
+     */
     void laserMapping::initInterface() {
-        //! Callback Groups
+        //! ========== 第一步：配置ROS2回调组 ==========
+        // 创建可重入回调组，允许多个回调并发执行
         cb_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
         rclcpp::SubscriptionOptions sub_options;
         sub_options.callback_group = cb_group_;
 
+        //! ========== 第二步：读取系统配置参数 ==========
+        // 读取全局参数配置
         if(!readGlobalparam(shared_from_this()))
         {
             RCLCPP_ERROR(this->get_logger(), "[SuperOdometry::laserMapping] Could not read calibration. Exiting...");
             rclcpp::shutdown();
         }
 
+        // 读取激光建图模块的参数配置
         if (!readParameters())
         {
             RCLCPP_ERROR(this->get_logger(), "[SuperOdometry::laserMapping] Could not read parameters. Exiting...");
             rclcpp::shutdown();
         }
 
+        // 读取传感器标定参数
         if (!readCalibration(shared_from_this()))
         {
             RCLCPP_ERROR(this->get_logger(), "[AriseSlam::laserMapping] Could not read parameters. Exiting...");
             rclcpp::shutdown();
         }
 
+        //! ========== 第三步：打印关键配置信息 ==========
         RCLCPP_INFO(this->get_logger(), "DEBUG VIEW: %d", config_.debug_view_enabled);
         RCLCPP_INFO(this->get_logger(), "ENABLE OUSTER DATA: %d", config_.enable_ouster_data);
         RCLCPP_INFO(this->get_logger(), "line resolution %f plane resolution %f vision_laser_time_offset %f",
                 config_.lineRes, config_.planeRes, vision_laser_time_offset);
 
+        //! ========== 第四步：配置点云降采样滤波器 ==========
+        // 设置角点（线特征）点云降采样的体素大小
         downSizeFilterCorner.setLeafSize(config_.lineRes, config_.lineRes, config_.lineRes);
+        // 设置平面点云降采样的体素大小
         downSizeFilterSurf.setLeafSize(config_.planeRes, config_.planeRes, config_.planeRes);
 
 
+        //! ========== 第五步：创建话题订阅者 ==========
+        // 订阅激光特征信息话题，接收特征提取节点发布的点云特征
         subLaserFeatureInfo = this->create_subscription<super_odometry_msgs::msg::LaserFeature>(
             ProjectName+"/feature_info", 2,
             std::bind(&laserMapping::laserFeatureInfoHandler, this,
                         std::placeholders::_1), sub_options);
                         
 
+        //! ========== 第六步：创建点云发布者 ==========
+        // 发布周围局部地图点云
         pubLaserCloudSurround = this->create_publisher<sensor_msgs::msg::PointCloud2>(
             ProjectName+"/laser_cloud_surround", 2);
 
+        // 发布当前地图点云
         pubLaserCloudMap = this->create_publisher<sensor_msgs::msg::PointCloud2>(
             ProjectName+"/laser_cloud_map", 2);
 
+        // 发布全局地图点云
         pubLaserCloudPrior = this->create_publisher<sensor_msgs::msg::PointCloud2>(
             ProjectName+"/overall_map", 2);
 
+        // 发布配准后的全分辨率点云
         pubLaserCloudFullRes = this->create_publisher<sensor_msgs::msg::PointCloud2>(
             ProjectName+"/registered_scan", 2);
 
 
+        //! ========== 第七步：创建里程计发布者 ==========
+        // 发布激光里程计结果
         pubOdomAftMapped = this->create_publisher<nav_msgs::msg::Odometry>(
             ProjectName+"/laser_odometry", 1);
 
+        // 发布增量式里程计（相对于初始位姿的增量）
         pubLaserOdometryIncremental = this->create_publisher<nav_msgs::msg::Odometry>(
             ProjectName+"/aft_mapped_to_init_incremental", 1);
 
 
+        // 发布视觉惯性里程计（VIO）预测结果
         pubVIOPrediction=  this->create_publisher<nav_msgs::msg::Odometry>(
             ProjectName+"/vio_prediction", 1);
 
+        // 发布激光惯性里程计（LIO）预测结果
         pubLIOPrediction= this->create_publisher<nav_msgs::msg::Odometry>(
             ProjectName+"/lio_prediction", 1);
 
 
+        //! ========== 第八步：创建路径和统计信息发布者 ==========
+        // 发布激光里程计轨迹路径
         pubLaserAfterMappedPath = this->create_publisher<nav_msgs::msg::Path>(
             ProjectName+"/laser_odom_path", 1);
 
+        // 发布优化统计信息（迭代次数、残差等）
         pubOptimizationStats = this->create_publisher<super_odometry_msgs::msg::OptimizationStats>(
             ProjectName+"/super_odometry_stats", 1);
 
   
-
+        // 发布预测源信息（IMU/VIO/LIO等）
         pubprediction_source = this->create_publisher<std_msgs::msg::String>(
             ProjectName+"/prediction_source", 1);
 
+        //! ========== 第九步：创建定时处理任务 ==========
+        // 创建100ms周期的定时器，用于周期性处理建图任务
         process_timer_ = this->create_wall_timer(
             std::chrono::milliseconds(static_cast<int>(100.)),
             std::bind(&laserMapping::process, this));
 
+        //! ========== 第十步：配置SLAM系统参数 ==========
+        // 初始化SLAM的ROS接口
         slam.initROSInterface(shared_from_this());
+        // 设置局部地图的线特征分辨率
         slam.localMap.lineRes_ = config_.lineRes;
+        // 设置局部地图的平面特征分辨率
         slam.localMap.planeRes_ = config_.planeRes;
+        // 设置视觉置信度因子，用于融合视觉信息时的权重
         slam.Visual_confidence_factor=config_.visual_confidence_factor;
+        // 设置位置退化阈值，用于检测定位退化
         slam.Pos_degeneracy_threshold=config_.pos_degeneracy_threshold;
+        // 设置姿态退化阈值，用于检测姿态估计退化
         slam.Ori_degeneracy_threshold=config_.ori_degeneracy_threshold;
+        // 设置ICP最大迭代次数
         slam.LocalizationICPMaxIter=config_.max_iterations;
+        // 启用/禁用调试可视化
         slam.OptSet.debug_view_enabled=config_.debug_view_enabled;
+        // 设置速度失败阈值，用于检测运动异常
         slam.OptSet.velocity_failure_threshold=config_.velocity_failure_threshold;
+        // 设置最大平面特征数量
         slam.OptSet.max_surface_features=config_.max_surface_features;
+        // 设置偏航角权重比例
         slam.OptSet.yaw_ratio=yaw_ratio;
+        // 设置地图保存目录
         slam.map_dir=config_.map_dir;
+        // 设置定位模式（建图/定位）
         slam.localization_mode=config_.localization_mode;
+        // 设置初始位置 (x, y, z)
         slam.init_x=config_.init_x;
         slam.init_y=config_.init_y;
         slam.init_z=config_.init_z;
+        // 设置初始姿态 (roll, pitch, yaw)
         slam.init_roll=config_.init_roll;
         slam.init_pitch=config_.init_pitch;
         slam.init_yaw=config_.init_yaw;
 
+        //! ========== 第十一步：初始化预测源和时间戳 ==========
+        // 设置默认预测源为IMU方向
         prediction_source = PredictionSource::IMU_ORIENTATION;
+        // 初始化IMU里程计时间戳为0
         timeLatestImuOdometry = rclcpp::Time(0,0,RCL_ROS_TIME);
 
+        //! ========== 第十二步：初始化其他参数 ==========
         initializationParam();
 
     }
@@ -699,17 +756,53 @@ return PredictionSource::CONSTANT_VELOCITY;
     }
 
 
+    /**
+     * [功能描述]：执行SLAM优化（点云配准和位姿估计）
+     * 该函数完成以下任务：
+     * 1. 根据配置决定是否使用IMU的横滚角(roll)和俯仰角(pitch)作为约束
+     * 2. 调用SLAM定位函数进行点云配准和位姿优化
+     * 
+     * 说明：
+     * - 使用IMU姿态可以提高退化场景下的鲁棒性（如走廊、隧道等）
+     * - 某些传感器（如Livox mid360）可能不需要使用roll/pitch约束
+     * 
+     * @return 无返回值，优化结果通过slam对象的成员变量返回
+     */
     void laserMapping::performSLAMOptimization(){
+        //! ========== 第一步：配置IMU姿态约束 ==========
         tf2::Quaternion imu_roll_pitch;
-        if(config_.use_imu_roll_pitch){  // TODO: Livox mid360 not use roll pitch angle
+        
+        // 检查是否启用IMU的横滚角和俯仰角作为优化约束
+        if(config_.use_imu_roll_pitch){  
+            // TODO: Livox mid360等某些传感器不使用roll/pitch角约束
+            
+            // 启用IMU姿态约束标志
             slam.OptSet.use_imu_roll_pitch=true;
+            
+            // 从IMU预测的四元数中提取横滚角(roll)和俯仰角(pitch)
+            // 注意：这里只提取roll和pitch，yaw角由激光里程计优化得到
             imu_roll_pitch=utils::extractRollPitch(sensorMeas.imuPrediction);
+            
+            // 将提取的roll/pitch角设置到SLAM优化器中作为约束
             slam.OptSet.imu_roll_pitch=imu_roll_pitch;
         }else{
+            // 不使用IMU姿态约束
             slam.OptSet.use_imu_roll_pitch=false;
+            
+            // 设置为单位四元数(0,0,0,1)，表示无旋转约束
             slam.OptSet.imu_roll_pitch=tf2::Quaternion(0,0,0,1);
         }
 
+        //! ========== 第二步：执行SLAM定位和优化 ==========
+        /**
+         * SLAM定位函数参数说明：
+         * @param initialization - 是否为初始化阶段（影响优化策略）
+         * @param prediction_source - 预测源类型（IMU/VIO/LIO等）
+         * @param T_w_lidar - 输入/输出参数：世界坐标系到激光雷达的变换矩阵（位姿初值和优化结果）
+         * @param laserCloudCornerStack - 当前帧的角点（线特征）点云
+         * @param laserCloudSurfStack - 当前帧的平面点云
+         * @param timeLaserOdometry - 当前帧的时间戳
+         */
         slam.Localization(initialization, static_cast<LidarSLAM::PredictionSource>(prediction_source), T_w_lidar,
                  laserCloudCornerStack, laserCloudSurfStack, timeLaserOdometry);
     }
@@ -765,27 +858,73 @@ return PredictionSource::CONSTANT_VELOCITY;
         timeLaserOdometryPrev = timeLaserOdometry;
     }
 
+    /**
+     * [功能描述]：激光建图的主处理循环函数
+     * 该函数持续运行，执行以下核心任务：
+     * 1. 检查传感器数据是否可用
+     * 2. 从缓冲区中提取传感器数据（包括点云、IMU等）
+     * 3. 设置位姿初始猜测值（基于IMU预积分或运动模型）
+     * 4. 根据运动速度自适应调整体素滤波器大小
+     * 5. 执行SLAM优化（点云配准和位姿优化）
+     * 6. 更新系统状态并发布结果
+     * @return 无返回值
+     */
     void laserMapping::process() {
 
+        // 主循环：持续处理传感器数据直到ROS节点关闭
         while (rclcpp::ok()) {
+            //! ========== 第一步：检查数据可用性 ==========
+            // 检查是否有新的传感器数据到达
             if(!checkDataAvailable()){
+                // 如果没有数据，休眠2ms后继续检查，避免空转消耗CPU
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
                 continue;
             }
+            
+            // 使用try-catch捕获处理过程中的异常，确保系统稳定性
             try{
+                //! ========== 第二步：开始帧处理计时 ==========
+                // 创建计时器，用于统计单帧处理时间
                 utils::ScopedTimer timer("Frame Processing");
+                
+                //! ========== 第三步：提取传感器数据（线程安全） ==========
+                // 加锁保护共享数据缓冲区，防止多线程竞争
                 mBuf.lock(); 
+                // 从缓冲区提取当前帧的传感器测量数据（点云、IMU、时间戳等）
                 sensorMeas=extractSensorData();
+                // 清空已提取的传感器数据，释放缓冲区空间
                 clearSensorData();
+                // 解锁，允许其他线程访问缓冲区
                 mBuf.unlock();
+                
+                //! ========== 第四步：设置位姿初始猜测 ==========
+                // 基于IMU预积分、运动模型或上一帧位姿，设置当前帧位姿的初始估计值
+                // 好的初始猜测可以加速优化收敛并提高配准成功率
                 setInitialGuess();
+                
+                //! ========== 第五步：自适应调整体素大小 ==========
+                // 根据机器人运动速度动态调整点云降采样的体素大小
+                // 高速运动时使用较大体素以提高鲁棒性，低速时使用较小体素以提高精度
                 adjustVoxelSize();
+                
+                //! ========== 第六步：执行SLAM优化 ==========
+                // 执行核心SLAM算法：
+                // - 提取局部地图
+                // - 点云配准（ICP/点到面优化）
+                // - 位姿图优化
+                // - 退化检测和处理
                 performSLAMOptimization();
+                
+                //! ========== 第七步：更新位姿并发布结果 ==========
+                // 更新系统状态（位姿、速度、地图等）
+                // 发布里程计、点云、路径等ROS话题
                 updatePoseAndPublish();
                
+                //! ========== 第八步：更新统计和调试信息（已注释） ==========
                 //updateStatsAndDebugInfo();
 
             }catch(const std::exception&e){
+                // 捕获并记录处理过程中的异常，避免程序崩溃
                 RCLCPP_ERROR(this->get_logger(), "Error in frame processing: %s", e.what());
             }
         }
